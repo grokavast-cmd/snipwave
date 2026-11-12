@@ -1,0 +1,1414 @@
+CLIP MAKER: HOW THE CODE WORKS
+==============================
+
+Written so that someone else (or another program) can understand the project well enough
+to rebuild or change it. This describes the code as it actually exists in the clip-maker
+folder. Nothing here is invented.
+
+The public repository is:
+https://github.com/grokavast-cmd/clip-maker
+
+
+1. WHAT THE APP DOES
+====================
+
+Clip Maker is a small personal macOS app. You paste a YouTube link, choose a start time
+and an end time, pick MP3 (audio) or MP4 (video), and click Make clip. The app downloads
+only that section when it can, converts it, and saves the file (by default to your
+Downloads folder).
+
+It is built from three main pieces of software:
+    yt-dlp         talks to YouTube and downloads media
+    ffmpeg         cuts and converts audio and video
+    CustomTkinter  a modern-looking window toolkit on top of Python's Tk
+
+The window follows the Mac's light or dark mode. There is also a Use cookies from option
+for age-restricted videos, a Cancel button, a Show in Finder button, and an Update
+downloader button that upgrades yt-dlp inside the app's private Python environment.
+
+
+2. THE BIG PICTURE
+==================
+
+The project is a folder of scripts, not a self-contained signed Mac app. The .app that
+make_app.sh creates is only a thin wrapper. It still points back at this folder and runs
+the Python inside it.
+
+How the pieces fit together:
+
+    Finder / Dock / Terminal
+            |
+            |  double-click "Clip Maker.command"
+            |  or click "~/Applications/Clip Maker.app"
+            v
+    Clip Maker.command   (bash launcher)
+            |  first run: Homebrew ffmpeg, official Deno installer,
+            |             a Python with working Tk, then a private
+            |             virtualenv at .venv and pip install of
+            |             requirements.txt
+            |  later runs: skip setup and jump straight to Python
+            v
+    .venv/bin/python app.py
+            |
+            |  CustomTkinter window (all the buttons and fields)
+            |  background threads talk to core.py
+            v
+    core.py
+            |  fetch_info, fetch_thumbnail, ClipJob, update_downloader
+            |
+            |  ClipJob.run() starts a child process:
+            |      python core.py --worker '{json job}'
+            v
+    worker process (still core.py)
+            |  1. yt-dlp + ffmpeg: download only the chosen section
+            |  2. if that is refused: download the full stream, then
+            |     cut and encode locally with ffmpeg
+            v
+    output file in the chosen folder (MP3 or H.264/AAC MP4)
+
+The GUI never talks to YouTube or ffmpeg itself. app.py only builds the window and starts
+work on background threads. core.py holds every bit of download and cut logic, which is
+why the tests can run without opening a window.
+
+3. FILE-BY-FILE WALKTHROUGH
+===========================
+
+The files that make up the app (ignoring .git, .venv, and __pycache__):
+
+    Clip Maker.command     bash launcher and first-run installer
+    make_app.sh            optional builder for a Dock-friendly .app
+    app.py                 the window (CustomTkinter only)
+    core.py                download, cut, config, and error messages
+    requirements.txt       Python packages to install into .venv
+    tests/test_core.py     headless tests for core.py
+    assets/icon.icns       Mac app icon used by make_app.sh
+    assets/icon.png        the same artwork as a PNG
+    README.md              user-facing setup and usage notes
+    .gitignore             ignores .venv, __pycache__, *.pyc, .DS_Store
+    screenshots/main.png   the screenshot shown in the README
+
+3.1  requirements.txt
+---------------------
+
+Four pip packages, one per line:
+
+    customtkinter>=5.2.2    the window toolkit
+    pillow>=10.0            opens the video thumbnail image
+    yt-dlp[default]         YouTube downloader, with its default extras
+    certifi                 a set of TLS certificates (needed because
+                            python.org Python on macOS often has none)
+
+The [default] extra on yt-dlp is also what Update downloader reinstalls.
+
+3.2  Clip Maker.command
+-----------------------
+
+A bash script you can double-click in Finder. It uses "set -u" (error on unset variables).
+It figures out its own folder as APP_DIR, cds there, and adds Homebrew and Deno to PATH:
+
+    /opt/homebrew/bin:/usr/local/bin:$HOME/.deno/bin:$PATH
+
+The private environment is APP_DIR/.venv. A stamp file, .venv/.clipmaker-ready-v1, stores
+a checksum (cksum) of requirements.txt. If you later change requirements.txt, the next
+launch will reinstall the packages.
+
+Helper functions:
+
+    pause_and_exit [code]
+        Prints a blank line, waits for Enter if stdin is a terminal, then exits. Used so a
+        double-clicked Terminal window does not vanish before you can read an error.
+
+    launch
+        Replaces the shell with .venv/bin/python APP_DIR/app.py plus any leftover
+        arguments, so the Python process is the one that stays running.
+
+    brew_install FORMULA
+        Runs "brew list --formula" first. Installs only if the formula is missing. On
+        failure, prints a message and calls pause_and_exit.
+
+    good_python PATH
+        Returns success only if that interpreter is Python 3.9 or newer, its tkinter
+        reports Tk 8.6 or newer, and tkinter.Tcl() works. Homebrew's python formula often
+        ships without Tk, which is why this check exists.
+
+Flags and the fast path:
+
+    --reinstall
+        Deletes .venv entirely, then continues as a first run. The flag is shifted off the
+        argument list so it is not passed to app.py.
+
+    Fast path (no setup):
+        If .venv/bin/python is executable, the stamp file exists, the stamp matches the
+        current requirements.txt checksum, AND ffmpeg is on PATH, it calls launch
+        immediately.
+
+First-run setup, in order:
+
+    1. If brew is missing, print install instructions from brew.sh and stop. It does not
+    install Homebrew for you.
+    2. brew_install ffmpeg.
+    3. If neither deno nor node is already on PATH, install Deno with the official
+    installer:
+
+       curl -fsSL https://deno.land/install.sh | sh -s -- -y --no-modify-path
+
+    then add $HOME/.deno/bin to PATH. This avoids Homebrew, which on older macOS would
+    compile Deno from source and demand a newer Xcode.
+    4. Search for a usable Python, in this order:
+
+       $(brew --prefix)/opt/python@3.13/bin/python3.13
+       $(brew --prefix)/opt/python@3.12/bin/python3.12
+       /Library/Frameworks/Python.framework/Versions/3.13/bin/python3
+       /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+       /Library/Frameworks/Python.framework/Versions/Current/bin/python3
+       $(brew --prefix)/bin/python3
+
+    If one of the Homebrew 3.13/3.12 binaries exists but fails good_python, it installs
+    the matching python-tk@X.Y formula and retries. If still nothing works, it installs
+    python@3.12 and python-tk@3.12.
+    5. Create .venv with that Python if needed.
+    6. Upgrade pip, then pip install -r requirements.txt.
+    7. Import-check tkinter, customtkinter, yt_dlp, and PIL. On failure, tell you to rerun
+    with --reinstall.
+    8. Write the requirements checksum into the stamp file and launch.
+
+3.3  make_app.sh
+----------------
+
+Builds ~/Applications/Clip Maker.app. It is a wrapper, not a copy of the project. The
+folder path is baked into the wrapper at build time, so if you move or rename the
+clip-maker folder you must run this script again from the new location.
+
+What it does:
+
+    1. APP_DIR is the folder that contains make_app.sh (resolved to an absolute path).
+    DEST_DIR is $HOME/Applications. The bundle path is $HOME/Applications/Clip Maker.app.
+    2. Deletes any existing bundle, then creates Contents/MacOS and Contents/Resources.
+    3. Writes Info.plist with:
+
+           CFBundleName / CFBundleDisplayName    Clip Maker
+           CFBundleIdentifier                    local.clipmaker.app
+           CFBundleVersion / ShortVersion        1.0
+           CFBundleExecutable                    ClipMaker
+           CFBundleIconFile                      AppIcon
+           LSMinimumSystemVersion                11.0
+           NSHighResolutionCapable               true
+
+    4. Writes Contents/MacOS/ClipMaker, a bash script that:
+       - exports the same PATH extras as the launcher (Homebrew plus Deno)
+       - if APP_DIR is gone, shows an osascript alert telling you to rerun make_app.sh
+       from the folder's new location, and exits
+       - if .venv/bin/python exists AND the stamp file .venv/.clipmaker-ready-v1 exists,
+       it cds to APP_DIR and runs .venv/bin/python app.py, with stdout and stderr
+       redirected to ~/Library/Logs/ClipMaker.log. If that process exits non-zero, it
+       shows an alert and opens the log in TextEdit.
+       - otherwise it opens Clip Maker.command in Terminal, so you can watch first-run
+       setup.
+    5. Copies assets/icon.icns to Contents/Resources/AppIcon.icns if the file is present.
+    6. Runs "xattr -dr com.apple.quarantine" on both the new bundle and APP_DIR, so
+    Gatekeeper is less likely to block a double-click.
+    7. "touch"es the bundle so Finder refreshes the icon.
+
+3.4  app.py
+-----------
+
+The entire GUI. It imports customtkinter as ctk, and core. It does not call yt-dlp or
+ffmpeg itself.
+
+Module-level constants and setup:
+
+    APP_TITLE          "Clip Maker"
+    ACCENT             "#E5484D"    (a YouTube-ish red)
+    ACCENT_HOVER       "#C83A3F"
+    COOKIE_BROWSERS    ["None", "Safari", "Chrome", "Firefox",
+                        "Brave", "Edge", "Opera"]
+
+    ctk.set_appearance_mode("system")    follows macOS light/dark
+    ctk.set_default_color_theme("blue")
+
+    _font(size=13, weight="normal")
+        Returns a CTkFont. Used everywhere for consistent type size.
+
+Class TimeField (a CTkFrame):
+
+A labelled time control: Start or End, a HH:MM:SS text box, and a slider, kept in sync.
+
+    __init__(master, label, on_change)
+        Builds the label, a StringVar defaulting to 00:00:00, a Menlo 13 pt entry, and a
+        red slider from 0 to 1. Return and FocusOut on the entry call _from_entry. The
+        slider calls _from_slider. A private _lock flag stops the two widgets from
+        fighting each other when one of them updates the other.
+
+    configure_range(maximum, value)
+        Sets the slider's upper bound to max(1.0, maximum). If the range is 20,000 seconds
+        or less, number_of_steps is the integer length so the slider moves in whole
+        seconds. Then set(value).
+
+    set(seconds)
+        Clamps to 0..max, moves the slider, and writes core.format_time(seconds) into the
+        box.
+
+    get() -> float
+        Returns core.parse_time of the box's text. Can raise ValueError if the text is not
+        a valid time.
+
+    _from_slider(v)
+        If not locked, writes the formatted time into the box, resets the border colour,
+        and calls on_change(self).
+
+    _from_entry()
+        Parses the box. On success, moves the slider (capped at max) and resets the
+        border. On ValueError, paints the border ACCENT red. Always calls on_change(self)
+        afterwards.
+
+    set_enabled(on)
+        Enables or disables both the entry and the slider.
+
+Class ClipMakerApp (the main window, a CTk subclass):
+
+    __init__
+        Loads settings with core.load_config(). Starts with no VideoInfo, no ClipJob, and
+        no last_output. Creates a queue.Queue named events, used so background threads can
+        talk to the UI thread. Window size 720x760, minimum 640x700. Builds six UI
+        sections, disables the time controls until a video is loaded, starts polling the
+        event queue after 100 ms, checks for ffmpeg/Deno after 300 ms, binds
+        Command-Return to _make_clip, and handles the window-close button with _on_close.
+
+UI builders (all private):
+
+    _card(row, pady=(0, 12))
+        A rounded CTkFrame used as a "card" on the given grid row.
+
+    _build_header
+        Title "Clip Maker" (with a scissors symbol) and the subtitle "Save part of a
+        YouTube video as MP3 or MP4".
+
+    _build_url_card
+        URL entry (placeholder: Paste a YouTube link, with a Command-V hint), a Paste
+        button, and a red Get video button. Pressing Return in the box also fetches.
+
+    _build_video_card
+        A 192x108 thumbnail placeholder, a title label, a metadata label (uploader and
+        duration), and a Watch from start time button.
+
+    _build_clip_card
+        Start and End TimeFields, a Clip length label, a segmented MP4/MP3 control, and a
+        Quality dropdown. Quality choices come from core.AUDIO_QUALITIES or
+        core.VIDEO_QUALITIES via _on_kind.
+
+    _build_output_card
+        Save to, plus the current folder (shown with ~ for the home directory) and a
+        Change button.
+
+    _build_action_area
+        A wide Make clip button, a Cancel button and a Show in Finder button that are
+        shown only when relevant, a red progress bar, and a status line.
+
+    _build_footer
+        Use cookies from dropdown, the yt-dlp version label, and Update downloader. Also
+        starts a daemon thread that puts ("version", core.ytdlp_version()) on the event
+        queue.
+
+Helpers:
+
+    _pretty_path(p)
+        Replaces the home directory prefix with ~.
+
+    _status(text, kind="info")
+        Sets the status line. kind is "info", "error" (red), or "ok" (green).
+
+    _save_prefs()
+        Writes kind, cookies_browser, and either audio_quality or video_quality into the
+        config and calls core.save_config. For MP3 it stores only the first word of the
+        quality label (so "192 kbps" becomes "192").
+
+    _set_video_enabled(on)
+        Enables or disables the two TimeFields, the preview button, and Make clip.
+
+    _set_busy(busy)
+        While work is running: disables Get video, Update downloader, format, and quality;
+        enables time controls only if a video is already loaded and we are not busy; hides
+        Show in Finder and shows Cancel. When not busy, hides Cancel.
+
+Actions:
+
+    _check_tools()
+        Calls core.check_tools(). If ffmpeg is missing, shows an error asking you to brew
+        install ffmpeg. If no JavaScript runtime was found, shows a tip to brew install
+        deno. (The launcher itself installs Deno with the official installer, not with
+        Homebrew. This tip is only a status message.)
+
+    _paste()
+        Puts the clipboard into the URL box and calls _fetch. Silently ignores clipboard
+        errors.
+
+    _on_kind(kind, save=True)
+        Rebuilds the Quality menu. MP3: "128 kbps", "192 kbps", "320 kbps". MP4: "Best",
+        "1080p", "720p", "480p". If the saved value is not in the list, it falls back to
+        the second item ("192 kbps" or "1080p"). Optionally saves prefs.
+
+    _choose_dir()
+        Native folder picker. On a choice, updates the label and saves config.
+
+    _fetch()
+        Normalizes the URL with core.normalize_url (shows a ClipError immediately if that
+        fails). Clears self.info, goes busy, starts an indeterminate progress bar, and
+        starts a daemon thread that calls core.fetch_info and core.fetch_thumbnail,
+        putting ("info", ...), ("thumb", ...), or ("fetch_error", ...) on the event queue.
+
+    _show_info(info)
+        Stores the VideoInfo, shows title / uploader / duration, sets both sliders' range
+        to the duration (or 3600 seconds if duration is unknown), puts Start at 0 and End
+        at min(duration, 30), updates the length label, and shows Loading on the
+        thumbnail.
+
+    _show_thumb(data)
+        Opens the JPEG/PNG bytes with Pillow, shrinks them to at most 192x108, wraps them
+        in a CTkImage, and displays them. On failure or empty data, shows (no preview).
+
+    _times()
+        Reads both TimeFields, runs core.validate_range, and returns (start, end) in
+        seconds.
+
+    _on_time_change(field)
+        Called whenever a slider moves or a time box is committed. If no video is loaded,
+        it returns immediately. (This was part of a real bug: the controls used to stay
+        locked because self.info was still None when the UI tried to enable them. _handle
+        now stores the info before calling _set_busy(False).) If the user is dragging
+        Start past End, End is pushed to start+1 (capped at duration). If they drag End
+        before Start, Start is pulled to end-1 (floored at 0). Then it shows Clip length:
+        HH:MM:SS, or the validation error.
+
+    _preview()
+        Opens the video in the default browser at the start time, by appending ?t=Ns or
+        &t=Ns to the video URL.
+
+    _make_clip()
+        Returns immediately if there is no video or a job is already running. Validates
+        the times. Builds a core.ClipJob with the current info, times, kind, quality
+        (first word of the quality label), output folder, cookie browser, and an
+        on_progress callback that queues ("progress", (frac, text)). Starts a daemon
+        thread that calls job.run() and queues "done", "cancelled", or "clip_error".
+
+    _cancel()
+        If a job exists, sets the status to Cancelling and calls job.cancel() on a daemon
+        thread.
+
+    _reveal()
+        Calls core.reveal_in_finder on the last successful output.
+
+    _update_downloader()
+        Disables the button (label becomes Updating) and starts a daemon thread that calls
+        core.update_downloader() and queues ("updated", (ok, message)).
+
+    _on_close()
+        Cancels any running job, then destroys the window.
+
+Event pump:
+
+    _poll_events()
+        Drains the queue with get_nowait, calls _handle for each item, and reschedules
+        itself every 100 ms with after(). This is how all background work reaches the UI
+        thread. Tk is not thread-safe, so widgets are only touched here (and in the
+        methods that __init__ and user clicks call).
+
+    _handle(kind, val)
+        Dispatches each queued event:
+
+        "info"          show the video, then _set_busy(False) so
+                       the time controls unlock (self.info is set
+                       first on purpose)
+        "thumb"         show the thumbnail
+        "fetch_error"   stop the spinner, un-busy, show the error
+        "progress"      (frac, text): if frac is None, use an
+                       indeterminate bar; otherwise set the
+                       determinate fraction and the status text
+        "done"          val is the output path; show Show in
+                       Finder and a green Saved: filename
+        "cancelled"     reset the bar, status Cancelled.
+        "clip_error"    show the error in red
+        "version"       set the footer to "yt-dlp VERSION"
+        "updated"       restore the Update button, show the
+                       message, and refresh the version label
+                       on another background thread
+
+Function main():
+
+Builds ClipMakerApp and enters the Tk main loop. If sys.argv[1] starts with "http", it
+fills the URL box and schedules _fetch after 400 ms. The launcher does not currently pass
+a URL, but you can run app.py with a link yourself.
+
+3.5  core.py
+------------
+
+All of the non-GUI logic. Safe to import from tests without opening a window. At import
+time it extends PATH with:
+
+    /opt/homebrew/bin
+    /usr/local/bin
+    /opt/local/bin
+    ~/.deno/bin
+
+Finder-launched apps get a very short PATH, so without this, ffmpeg and deno would often
+be "missing" even when they are installed.
+
+Constants:
+
+    APP_NAME            "ClipMaker"   (used for the config folder)
+    AUDIO_QUALITIES     ["128", "192", "320"]           (kbps)
+    VIDEO_QUALITIES     ["Best", "1080p", "720p", "480p"]
+
+Exceptions:
+
+    ClipError     an error whose message is safe to show in the window
+    Cancelled     raised when the user hits Cancel
+
+Config:
+
+    config_dir() -> Path
+        macOS:  ~/Library/Application Support/ClipMaker
+        other:  $XDG_CONFIG_HOME/ClipMaker or ~/.config/ClipMaker
+        Creates the folder if needed.
+
+    default_output_dir() -> str
+        ~/Downloads if that folder exists, otherwise the home folder.
+
+    load_config() -> dict
+        Starts with defaults:
+
+            output_dir         default_output_dir()
+            kind               "MP4"
+            audio_quality      "192"
+            video_quality      "1080p"
+            cookies_browser    "None"
+
+        Then overlays ~/Library/Application Support/ClipMaker/config.json if it can be
+        read. If the saved output_dir is no longer a directory, it falls back to the
+        default. Any read error is ignored; you just get the defaults.
+
+    save_config(cfg)
+        Writes that JSON file with indent=2. Write errors are ignored.
+
+Time and names:
+
+    parse_time(text) -> float
+        Accepts "1:02:03", "2:03", "45", "1:05.5". Splits on colons (at most three parts).
+        Each part must be a number. Minutes and seconds (any part after the first) must be
+        under 60. Empty or junk input raises ValueError.
+
+    format_time(sec) -> str
+        Whole seconds as "HH:MM:SS", always zero-padded.
+
+    _stamp(sec) -> str
+        Filename-safe stamp: 65 -> "1m05s", 3725 -> "1h02m05s".
+
+    sanitize_filename(name, max_len=120) -> str
+        Replaces backslash, slash, colon, asterisk, question mark, quotes, angle brackets,
+        pipe, and control characters with spaces, collapses whitespace, strips dots and
+        spaces from the ends, and truncates to 120 characters. Empty results become
+        "clip".
+
+    validate_range(start, end, duration)
+        Raises ClipError if start is negative, end is not after start, end is more than
+        half a second past the video's duration, or the clip is shorter than half a
+        second.
+
+External tools:
+
+    find_ffmpeg() -> optional path
+        shutil.which("ffmpeg"), after the PATH extension above.
+
+    find_js_runtimes() -> dict
+        Looks for deno, node, and bun on PATH. Returns a dict like {"deno": {"path":
+        "/Users/.../.deno/bin/deno"}}. yt-dlp wants this shape for its js_runtimes option.
+
+    check_tools() -> dict
+        {"ffmpeg": path or None, "js": find_js_runtimes()}
+
+    ytdlp_version() -> str
+        Runs the current interpreter with: import yt_dlp.version as v;
+        print(v.__version__). 30 second timeout. Returns "unknown" on failure.
+
+    update_downloader() -> (ok, message)
+        pip install --upgrade --disable-pip-version-check yt-dlp[default] using
+        sys.executable (so it stays inside the app's venv). 300 second timeout. Does not
+        update ffmpeg, Deno, or the app itself. If the version is unchanged: "Downloader
+        is up to date (yt-dlp VERSION)." If it changed: "Updated yt-dlp OLD -> NEW.
+        Restart Clip Maker to use it." On failure, returns (False, ...) with a short tail
+        of pip's output.
+
+Friendly errors and URLs:
+
+    friendly_error(msg) -> str
+        Strips ANSI colour codes, then maps known yt-dlp / network phrases to short
+        plain-English sentences. See section 6 for the full list. Anything unmatched
+        becomes "Something went wrong: " plus the first line, trimmed to 300 characters.
+
+    _looks_like_url(url) -> bool
+        True if it is http(s)://... or a bare youtube.com / youtu.be / music.youtube.com /
+        m.youtube.com path.
+
+    normalize_url(url) -> str
+        Strips whitespace. Empty raises ClipError: Paste a YouTube link first. If there is
+        no scheme, prepends https://. If it still does not look like a URL: That doesn't
+        look like a link. It should start with https://. Returns the cleaned URL. Note:
+        this is a light check, not a YouTube-only check. A non-YouTube https URL can get
+        past this and fail later inside fetch_info, where friendly_error handles
+        Unsupported URL.
+
+yt-dlp options:
+
+    class _QuietLogger
+        A logger with debug/info/warning/error all as no-ops, so yt-dlp does not print to
+        the Terminal. Failures still arrive as Python exceptions.
+
+    _base_opts(cookies_browser="None") -> dict
+        Shared yt-dlp options: quiet, no warnings, no progress bar, no playlist expansion
+        (a watch?v=..&list=.. link means just that one video), 20 second socket timeout, 3
+        retries and 3 fragment retries, plus js_runtimes and ffmpeg_location when those
+        tools are found. If cookies_browser is not "None" or empty, sets
+        cookiesfrombrowser to a one-element tuple of the lowercased browser name (the
+        shape yt-dlp expects).
+
+Dataclass VideoInfo:
+
+Fields: url, id, title, duration (float or None), thumbnail (a URL or None), uploader
+(default empty), is_live (default False), raw_formats (list, hidden from repr; used later
+to estimate download size), thumbnails (list of candidate image URLs, also hidden from
+repr).
+
+    fetch_info(url, cookies_browser="None") -> VideoInfo
+        Normalizes the URL, calls yt-dlp extract_info with skip_download=True, then
+        sanitize_info. On any exception, raises ClipError(friendly_error(...)). None info
+        is an error. If yt-dlp returns a playlist, it uses the first entry, or errors
+        with: That's a playlist link. Open a single video and copy its link. Live or
+        upcoming premieres raise ClipError. Thumbnail candidates for YouTube IDs are, in
+        order:
+
+            https://i.ytimg.com/vi/ID/hqdefault.jpg
+            https://i.ytimg.com/vi/ID/mqdefault.jpg
+            https://i.ytimg.com/vi/ID/default.jpg
+
+        then whatever thumbnail URL yt-dlp provided. Duration is taken from the info dict
+        when present.
+
+    fetch_thumbnail(info) -> bytes or None
+        Tries each URL in info.thumbnails (or the single thumbnail) until one returns
+        bytes.
+
+    fetch_thumbnail_bytes(url, timeout=15) -> bytes
+        urllib request with a Mozilla user-agent. Uses certifi's certificate bundle when
+        that package is importable, because python.org Python on macOS often has no root
+        certificates.
+
+Format selection and download options:
+
+    format_selector(kind, quality) -> str
+        A yt-dlp format string.
+        MP3:  "ba[ext=m4a]/ba/b"
+        (best m4a audio, else best audio, else best combined)
+        MP4:  prefer H.264 (avc1) video plus AAC (m4a) audio, optionally limited by height
+        for 1080p/720p/480p. "Best" has no height cap. Fallbacks walk down to any
+        video+audio, then any single combined stream. The idea is: take a
+        QuickTime-friendly pair if YouTube has one, otherwise take whatever exists and
+        re-encode later.
+
+    build_download_opts(kind, quality, start, end, out_dir,
+                        basename, temp_dir, cookies_browser="None")
+        Builds the options for the section download:
+
+            format                    from format_selector
+            download_ranges           yt_dlp.utils.download_range_func
+                                      with the single (start, end) pair
+            force_keyframes_at_cuts   True
+                                      (re-encodes around the cut points
+                                      so the start and end are accurate,
+                                      not stuck to the nearest keyframe)
+            paths.home                the user's output folder
+            paths.temp                a temporary folder
+            outtmpl                   basename.%(ext)s
+                                      (percent signs in the basename are
+                                      doubled so yt-dlp does not treat
+                                      them as template codes)
+            overwrites                True
+
+        For MP3, adds a FFmpegExtractAudio postprocessor with preferredcodec "mp3" and
+        preferredquality set to the kbps string (128, 192, or 320). For MP4, sets
+        merge_output_format to "mp4" and format_sort to prefer h264, aac, resolution, fps.
+        Always adds an FFmpegMetadata postprocessor so the title is written into the file.
+
+    unique_basename(out_dir, title, start, end, ext) -> str
+        "{sanitized_title}_{startstamp}-{endstamp}", or the same with " (2)", " (3)", ...
+        if "{name}.{ext}" already exists in out_dir. The returned value is the basename
+        without the extension.
+
+    ffprobe_streams(path) -> dict
+        Runs ffprobe (next to ffmpeg if "ffprobe" is not on PATH) and returns {"duration":
+        float, "vcodec": str or None, "acodec": str or None}. Used by tests and by the
+        QuickTime compatibility check.
+
+The worker process:
+
+When core.py is started as python core.py --worker '{json}', it calls _worker_main and
+exits with that function's return code. The JSON job dict contains: url, kind, quality,
+start, end, out_dir, basename, temp_dir, cookies_browser, title.
+
+    _emit(**kw)
+        Writes one JSON object per line to stdout. The parent ClipJob reads these lines as
+        progress and result events.
+
+    _worker_main(job) -> int
+        1. Fast path, try_section(): builds section-download options, attaches progress
+        hooks, and calls yt-dlp extract_info(..., download=True). On success it emits
+        {"event": "downloaded", "path": ...} and returns 0. The environment variable
+        CLIPMAKER_FORCE_FALLBACK, used by tests, forces this path to fail.
+        2. If the section download failed with a message containing "ffmpeg exited",
+        "403", "forbidden", or "file wasn't found", it emits a "fallback" event, clears
+        the temp folder, calls _download_full, then _cut_locally, and emits "downloaded".
+        Any other error is emitted as {"event": "error", "text": friendly_error(...)} and
+        the process returns 1.
+        Progress hooks emit:
+            "bytes"    during a download (done / total)
+            "stage"    when a postprocessor starts (ExtractAudio ->
+                       "Converting to MP3…", Merge -> "Joining video
+                       and audio…", Metadata -> "Adding title info…",
+                       otherwise "Finishing up…") or when a file
+                       finishes downloading ("Part downloaded…")
+
+    _process(ydl, job) -> dict
+        Always looks the video up again with extract_info(url, download=True). It
+        deliberately does not reuse the formats from Get video, because YouTube stream
+        links are tied to the session that fetched them, and reusing them from another
+        process often gets HTTP 403.
+
+    _download_full(job, dl_hook) -> path
+        Downloads the whole chosen stream into temp_dir as source.%(ext)s, with no
+        download_ranges. For video, merge format is mkv so any codec can be stored; the
+        local cut will re-encode. Returns the resulting filepath.
+
+    _cut_locally(job, src) -> path
+        ffmpeg command:
+
+            ffmpeg -y -v error -nostdin
+                   -ss START -i SRC -t LENGTH
+                   -map_metadata -1
+                   -metadata title=TITLE
+                   then either:
+                       MP3: -vn -c:a libmp3lame -b:a {quality}k
+                       MP4: -c:v libx264 -preset veryfast -crf 20
+                            -pix_fmt yuv420p -c:a aac -b:a 192k
+                            -movflags +faststart
+                   -progress pipe:1 OUTPUT
+
+        -ss is placed before -i (input seeking, which is fast). Progress lines starting
+        with out_time_us= or out_time_ms= are turned into {"event": "cut", "frac": 0..1}.
+        On a non-zero ffmpeg exit, raises RuntimeError.
+
+Class ClipJob (what the GUI and the tests call):
+
+    __init__(info, start, end, kind, quality, out_dir,
+             cookies_browser="None", on_progress=None)
+        Stores the arguments (kind is uppercased). on_progress is a callback (fraction or
+        None, status text). Creates a threading.Event for cancellation and a slot for the
+        child Popen object.
+
+    cancel()
+        Sets the cancel event and calls _kill().
+
+    cancelled   (property)
+        Whether the cancel event is set.
+
+    _kill()
+        If the child is still running, sends SIGTERM to its process group (os.killpg),
+        which also stops the ffmpeg processes yt-dlp started. Waits up to 3 seconds, then
+        SIGKILL / kill. start_new_session=True on Popen is what makes killpg work.
+
+    _check()
+        Raises Cancelled if the cancel event is set.
+
+    _estimated_bytes() -> int
+        Uses VideoInfo.raw_formats and the clip's fraction of the full duration to guess
+        how many bytes a section download should be, so the progress bar can move. For MP3
+        it looks at m4a-only audio formats. For MP4 it looks at avc1 video at or below the
+        chosen height, plus m4a audio. Returns 0 if it cannot guess (the UI then uses an
+        indeterminate bar, or a megabyte count without a fraction).
+
+    run() -> str
+        Blocking. Returns the final file path. Raises ClipError or Cancelled.
+        Steps:
+        - validate the time range
+        - require ffmpeg, a real output folder, and write permission
+        - pick a unique basename
+        - create a temp dir named clipmaker-...
+        - start the worker as a child process: sys.executable (the venv Python) running
+        path/to/core.py --worker '{json}', with stdout and stderr piped,
+        start_new_session=True
+        - start a watcher thread that, every 0.5 s, adds up the sizes of files in the temp
+        dir and of any file in the output folder that starts with the basename. It reports
+        progress as 0.05 + 0.85 * (got / estimate), capped at 0.9, or an indeterminate
+        update if there is no estimate. This exists because ffmpeg section downloads often
+        do not report byte progress through yt-dlp.
+        - start a thread that drains stderr (so the pipe cannot fill up and stall the
+        worker)
+        - read stdout line by line, parse JSON events, and update on_progress:
+
+              stage / post      0.92 and the postprocessor text;
+                                also stops the disk watcher
+              fallback          0.05 and the fallback message;
+                                the disk watcher then stands down
+              bytes (fallback)  0.05 + 0.75 * done/total
+              cut               0.8 + 0.18 * frac
+              downloaded        store the path
+              error             store the friendly error
+
+        - wait for the process
+        - if cancelled, raise Cancelled
+        - if no path, raise ClipError from stderr or: The download stopped unexpectedly.
+        - for MP4, call _ensure_quicktime_compatible
+        - report 1.0 "Done!" and return the path
+        On Cancelled, it also deletes any half-written basename.mp3 / .mp4 / .m4a / .webm
+        / .part in the output folder. The temp dir is always deleted in a finally block.
+
+    _ensure_quicktime_compatible(path) -> path
+        For MP4 only, after the worker finishes. Runs ffprobe. If the file is already
+        H.264 (or has no video stream) and AAC (or no audio) and ends with .mp4, it is
+        left alone. Otherwise ffmpeg re-encodes to libx264 (preset medium, crf 20,
+        yuv420p) + AAC 192k with +faststart, then replaces the original. This covers VP9,
+        AV1, or Opus, which QuickTime will not play.
+
+    reveal_in_finder(path)
+        macOS:  open -R path   (reveals the file in Finder)
+        other:  xdg-open the containing folder
+
+Environment variables used in core.py (all optional):
+
+    CLIPMAKER_FORCE_FALLBACK    force the full-download path (tests)
+    CLIPMAKER_DEBUG             print extra failure text to stderr
+
+3.6  tests/test_core.py
+-----------------------
+
+Headless tests. Run from the project folder:
+
+    .venv/bin/python -m tests.test_core
+    .venv/bin/python -m tests.test_core --online
+    .venv/bin/python -m tests.test_core --online --fallback
+
+    test_helpers()
+        Checks parse_time (including rejected values: empty, 1:99, a:b, 1:2:3:4),
+        format_time, sanitize_filename, _stamp, validate_range, and several friendly_error
+        phrases.
+
+    test_local_cut()
+        Offline. ffmpeg generates a 20 second 640x360 VP9 + Opus test video, then
+        _cut_locally is asked for a 10 second MP3 at 192 kbps and a 10 second 720p MP4.
+        Asserts duration is within 0.2 s of 10, and codecs are mp3 or h264+aac.
+
+    run_clip(...)  and the --online block
+        Fetches a real video (default: https://www.youtube.com/watch?v=jNQXAC9IVRw ,
+        overridable with the TEST_URL environment variable) and makes a 10 second MP3 and
+        a 10 second 1080p MP4. --fallback also sets CLIPMAKER_FORCE_FALLBACK and makes a
+        7.5 second MP3 at 320 and a 7.5 second 720p MP4.
+
+3.7  assets/, README.md, .gitignore, screenshots/
+-------------------------------------------------
+
+    assets/icon.icns       Mac icon copied into the .app bundle
+    assets/icon.png        the same artwork in PNG form
+    screenshots/main.png   used by the README (taken on Linux)
+    .gitignore             .venv/, __pycache__/, *.pyc, .DS_Store
+    README.md              end-user setup, usage, troubleshooting,
+                           and a short note on why Python +
+                           CustomTkinter was chosen. One path in
+                           the README still uses Documents as an
+                           example location; see section 7 for why
+                           the home folder is the safer place to
+                           keep the project if you build the .app
+                           wrapper.
+
+4. STEP-BY-STEP FLOWS
+=====================
+
+4.1  First-run setup
+--------------------
+
+    1. You double-click Clip Maker.command (or the .app, which opens that command in
+    Terminal if setup is not done yet).
+    2. The script notices there is no ready .venv stamp (or ffmpeg is missing) and prints
+    Clip Maker: one-time setup.
+    3. Homebrew must already be installed. If it is not, the script tells you how and
+    stops.
+    4. ffmpeg is installed with brew if needed (this can take a while, and on macOS 12
+    Homebrew may compile some things from source).
+    5. If Deno and Node are both missing, Deno is installed with the official installer
+    into ~/.deno, not with Homebrew.
+    6. A Python 3.9+ with Tk 8.6+ is found or installed (python@3.12 and python-tk@3.12 as
+    the last resort). On older macOS this compile step can take 20 to 40 minutes.
+    7. .venv is created, packages from requirements.txt are installed, the four imports
+    are checked, and the stamp is written.
+    8. app.py starts and the window opens. Later launches skip all of the above, as long
+    as the stamp still matches requirements.txt and ffmpeg is still on PATH.
+
+To wipe the private environment and do this again:
+
+    "./Clip Maker.command" --reinstall
+
+4.2  Fetching video info
+------------------------
+
+    1. You paste a link and click Get video, press Return, or click Paste (which also
+    starts the fetch). A URL can also be passed as argv[1] when starting app.py.
+    2. app.py calls core.normalize_url on the UI thread. A bad or empty string is shown
+    immediately, with no network call.
+    3. self.info is cleared and the time controls are locked. A spinner starts. A
+    background thread calls core.fetch_info (yt-dlp extract_info with no download) and
+    then core.fetch_thumbnail.
+    4. On success, the event pump stores the VideoInfo, fills in the title, uploader,
+    duration, and thumbnail, sets Start to 0:00 and End to 0:30 (or the full length if the
+    video is shorter), and unlocks the sliders, the time boxes, preview, and Make clip.
+    5. Cookies, if you picked a browser, are passed into yt-dlp as cookiesfrombrowser.
+    Live videos, upcoming premieres, empty playlists, and many YouTube error pages become
+    ClipError messages at this stage (see section 6).
+
+4.3  Making a clip
+------------------
+
+    1. You set Start and End (drag, or type 1:23 / 00:01:23 and press Return or leave the
+    box), choose MP4 or MP3 and a quality, and click Make clip or press Command-Return.
+    2. app.py validates the range, builds a ClipJob, goes busy, and starts job.run() on a
+    background thread.
+    3. ClipJob.run() checks ffmpeg and the output folder, picks a unique filename, makes a
+    temp directory, and starts a child process: python core.py --worker '{the job as
+    JSON}'.
+    4. Section download (the usual, faster path):
+        The worker asks yt-dlp for only the [start, end] range, with
+        force_keyframes_at_cuts so the edges are accurate. yt-dlp uses ffmpeg for the cut.
+        For MP3, a postprocessor then extracts MP3 at 128, 192, or 320 kbps. For MP4,
+        streams are merged into an mp4 container, preferring H.264 + AAC. Metadata (the
+        title) is added. Meanwhile the parent watches the temp folder's file sizes to
+        drive the progress bar, because this path often does not report byte counts.
+    5. Fallback (only if the section path failed with "ffmpeg exited", HTTP 403 /
+    forbidden, or a missing output file):
+        The worker tells the UI it will download the full video, then cut (slower). It
+        downloads the whole chosen stream into the temp folder (mkv for video, so any
+        codec will fit). Then _cut_locally runs ffmpeg: seek to start, take (end - start)
+        seconds, and encode.
+            MP3: libmp3lame at the chosen kbps, no video
+            MP4: libx264 veryfast, crf 20, yuv420p, AAC 192k, +faststart
+        Cut progress comes from ffmpeg's -progress pipe.
+    6. Encoding choices, summarised:
+        MP3 always ends as MP3 (either yt-dlp's ExtractAudio postprocessor on the section
+        path, or libmp3lame on the fallback path), at 128, 192, or 320 kbps.
+        MP4 aims for H.264 + AAC, which QuickTime, Photos, iMovie, and iPhone will play.
+        "Best" means the best QuickTime-friendly quality available, usually up to 1080p on
+        YouTube, with no artificial height cap in the format selector. If the section path
+        already produced H.264 + AAC in an .mp4, nothing more is done. If YouTube only
+        offered VP9, AV1, or Opus, ClipJob._ensure_quicktime_compatible re-encodes to
+        libx264 (preset medium, crf 20) + AAC 192k after the worker finishes.
+    7. Progress estimation:
+
+        0.02                    "Starting…"
+        0.05 .. 0.90             section download, from disk size
+                                 versus _estimated_bytes, or an
+                                 indeterminate bar if no estimate
+        0.92                     postprocess (convert / merge /
+                                 metadata)
+        0.05 then 0.05 .. 0.80   fallback full download
+        0.80 .. 0.98             local cut
+        0.94                     optional QuickTime re-encode
+        1.0                      "Done!"
+
+    8. Cancel: the Cancel button (or closing the window) calls ClipJob.cancel, which
+    signals the event and SIGTERMs the worker's process group. run() raises Cancelled,
+    half-written output is deleted, the temp folder is removed, and the UI says Cancelled.
+    9. On success the status shows Saved: filename and Show in Finder appears.
+
+4.4  Update downloader
+----------------------
+
+The footer button disables itself and shows Updating. A background thread runs
+core.update_downloader(), which is a pip upgrade of yt-dlp[default] inside the same
+virtualenv the app is already using. Nothing else on the Mac is touched: not ffmpeg, not
+Deno, not app.py. It needs internet and may take a few seconds (timeout 300 seconds). The
+status line then shows either that you are up to date, or the old and new version numbers,
+and asks you to restart to use a newly installed version. The footer version label is
+refreshed afterwards.
+
+4.5  Settings and where they live
+---------------------------------
+
+Saved automatically when you change format, quality, the cookies browser, or the output
+folder.
+
+File (macOS):
+
+    ~/Library/Application Support/ClipMaker/config.json
+
+Typical contents:
+
+    {
+      "output_dir": "/Users/you/Downloads",
+      "kind": "MP4",
+      "audio_quality": "192",
+      "video_quality": "1080p",
+      "cookies_browser": "None"
+    }
+
+This is separate from ~/Library/Logs/ClipMaker.log, which is only written when you start
+the app from the .app wrapper.
+
+4.6  Filename rules
+-------------------
+
+Pattern:
+
+    {sanitized title}_{start}-{end}.{mp3 or mp4}
+
+Examples:
+
+    Video Title_1m05s-1m30s.mp4
+    Video Title_1h02m05s-1h03m00s.mp3
+    Video Title_1m05s-1m30s (2).mp4    if the first name is taken
+
+Sanitizing removes path- and filesystem-illegal characters (backslash, slash, colon,
+asterisk, question mark, quotes, angle brackets, pipe, and control characters), collapses
+spaces, and caps the title at 120 characters. The uniqueness check looks at the final
+extension only (mp3 or mp4) in the output folder.
+
+5. THREADING AND PROCESSES
+==========================
+
+Why work leaves the UI thread
+-----------------------------
+
+Tk (and CustomTkinter) must be used from the thread that created the window. fetch_info,
+the download, pip upgrades, and even ytdlp_version can take seconds or minutes. If they
+ran on the UI thread, the window would freeze and macOS would tag the app as not
+responding.
+
+So every slow call is started with:
+
+    threading.Thread(target=work, daemon=True).start()
+
+Daemon threads die when the window closes. The work functions never touch widgets. They
+only put a (kind, value) tuple on self.events, a queue.Queue.
+
+The event queue and the poll loop
+---------------------------------
+
+__init__ schedules _poll_events after 100 ms. That method drains everything currently on
+the queue, calls _handle for each item (and _handle is the only place those results update
+the widgets), then schedules itself again 100 ms later. A 100 ms poll is simple and is
+fast enough for a progress bar.
+
+Event kinds: info, thumb, fetch_error, progress, done, cancelled, clip_error, version,
+updated.
+
+The separate process for Cancel
+-------------------------------
+
+A thread is not enough for Cancel. yt-dlp starts its own ffmpeg child processes. Killing a
+Python thread would leave those ffmpeg processes running.
+
+ClipJob.run() therefore starts a separate process:
+
+    python core.py --worker '{json}'
+
+with start_new_session=True, so the worker is the leader of a new process group. Cancel
+does os.killpg(pid, SIGTERM), which stops the worker and every ffmpeg it started, then
+SIGKILL if it has not exited in 3 seconds.
+
+The worker talks back only through stdout (one JSON object per line). stderr is drained on
+a side thread so a full pipe cannot stall the worker. A third thread in the parent watches
+the temp directory size during a section download.
+
+If you close the window during a job, _on_close calls cancel() before destroying the
+window.
+
+
+6. ERROR HANDLING
+=================
+
+Two layers:
+
+    1. ClipError is raised with a message that is already safe to show. Cancelled is a
+    separate exception for a user cancel (the UI shows Cancelled, not an error).
+    2. friendly_error(text) rewrites raw yt-dlp, ffmpeg, and network text. The GUI also
+    runs unexpected exceptions through it.
+
+Messages produced by friendly_error, and what triggers them (matching is case-insensitive,
+after ANSI codes are stripped):
+
+    "ffmpeg is missing. Open Terminal and run:  brew install ffmpeg"
+        The message mentions ffmpeg and "not found" or "not installed".
+        ClipJob.run() also raises a ClipError with this wording if find_ffmpeg()
+        returns nothing, without going through friendly_error. The window's
+        _check_tools shows a similar line at startup if ffmpeg is missing.
+
+    "This video is private, so it can't be downloaded."
+        The text contains "private video".
+
+    "This video is age-restricted. Pick your browser under
+     'Use cookies from' (where you're signed in to YouTube)
+     and try again."
+        "confirm your age", "age-restricted", "age restricted",
+        or "inappropriate for some users".
+
+    "YouTube asked to confirm you're not a bot. Try 'Update
+     downloader', or pick your browser under 'Use cookies from'
+     and try again."
+        "not a bot".
+
+    "YouTube refused the download (error 403). Click 'Update
+     downloader' and try again. If it keeps happening, pick your
+     browser under 'Use cookies from'."
+        "403" or "forbidden". (A 403 during the section download
+        is first used as a reason to try the fallback path. This
+        message appears if the fallback also fails, or if 403
+        happens somewhere that is not that section attempt.)
+
+    "This video is for channel members only."
+        "members-only" or "join this channel".
+
+    "Live streams and upcoming premieres can't be clipped yet."
+        "is live", "live event", or "premieres in". fetch_info also
+        raises this exact ClipError when the info dict says the
+        video is live or upcoming, before a download starts.
+
+    "That doesn't look like a YouTube video link. Copy the link
+     from the address bar and try again."
+        "unsupported url", "is not a valid url",
+        "incomplete youtube id", or "invalid url".
+
+    "That page doesn't have a video Clip Maker can read. Copy the
+     link of a YouTube video and try again."
+        "http error 404" or "[generic]".
+
+    "This video is unavailable (removed, region-blocked, or the
+     link is wrong)."
+        "video unavailable", "video is unavailable", "removed",
+        or "does not exist".
+
+    "This video was taken down for copyright reasons."
+        "copyright".
+
+    "Network problem: couldn't reach YouTube. Check your internet
+     connection and try again."
+        "unable to download webpage", "getaddrinfo",
+        "nodename nor servname", "timed out", "connection",
+        "network is unreachable",
+        "temporary failure in name resolution", "urlopen error",
+        "http error 5", or "ssl".
+
+    "Couldn't read that browser's cookies. Quit the browser and
+     try again, or set 'Use cookies from' back to None."
+        ("could not copy" and "cookie") or ("cookies" and
+        "database").
+
+    "That quality isn't available for this video. Try 'Best' or
+     a lower quality."
+        "requested format is not available".
+
+    "Something went wrong: " + the first line (max 300 characters)
+        Anything that did not match above. A leading "ERROR:" is
+        stripped.
+
+Other messages raised directly as ClipError (not via friendly_error):
+
+    "Paste a YouTube link first."
+    "That doesn't look like a link. It should start with https://"
+    "Couldn't read that video."
+    "That's a playlist link. Open a single video and copy its link."
+    "Start time can't be negative."
+    "End time must be after the start time."
+    "End time is past the end of the video (HH:MM:SS)."
+    "The clip must be at least half a second long."
+    "Output folder doesn't exist:" + the path
+    "Can't write to the output folder:" + the path
+    "The download stopped unexpectedly."
+    "Couldn't convert the video: " + a tail of ffmpeg's stderr
+
+The time boxes also show "Use times like 1:23 or 00:01:23" when the typed text cannot be
+parsed.
+
+The .app wrapper has its own alerts, which are not from Python:
+
+    "Can't find the Clip Maker folder at: {path}. Run make_app.sh
+     again from the folder's new location."
+    "Clip Maker couldn't start" plus "Details were saved to
+     ~/Library/Logs/ClipMaker.log. Opening it now."
+
+7. MACOS SPECIFICS AND GOTCHAS LEARNED
+======================================
+
+These are real issues this project ran into. They are not theoretical.
+
+Gatekeeper and quarantine
+-------------------------
+
+The files come from outside the App Store, and the author is not a registered Apple
+developer. The first time you double-click Clip Maker.command, macOS may say it "cannot be
+opened because it is from an unidentified developer."
+
+The reliable fix is: right-click (or Control-click) the file, choose Open, then click Open
+again. You only have to do this once per download. If there is no Open button, this
+Terminal command clears the quarantine flag for the whole folder:
+
+    xattr -dr com.apple.quarantine /path/to/clip-maker
+
+make_app.sh already runs that xattr command on both the new .app and the project folder. A
+freshly downloaded zip can still be flagged again.
+
+macOS 12 and Homebrew building from source
+------------------------------------------
+
+The app was used on macOS 12. On that version, Homebrew often has no ready-made (bottled)
+packages, so brew install compiles from source. That can take a long time, and some
+formulas need a newer Xcode than macOS 12 can install.
+
+That is exactly what happened with Deno: Homebrew tried to compile it and failed.
+Python/Tk can also take 20 to 40 minutes to compile on that system. Let the launcher
+finish; it opens the window on its own when setup is done.
+
+Deno comes from the official installer, not Homebrew
+----------------------------------------------------
+
+YouTube now requires a JavaScript runtime for yt-dlp to see all video formats. The
+launcher looks for deno or node, and if both are missing it runs:
+
+    curl -fsSL https://deno.land/install.sh | sh -s -- -y --no-modify-path
+
+That installs a ready-made Deno binary into ~/.deno/bin, which works on macOS 12. The
+flags mean yes, install, and do not edit my shell profile; PATH is updated only for that
+process (and later by the launcher and by core.py, which both add ~/.deno/bin).
+
+The status tip in app.py._check_tools still says brew install deno if no runtime is found
+at all. Prefer the official installer on older macOS.
+
+Documents, Downloads, and Desktop are protected
+-----------------------------------------------
+
+macOS privacy protection (TCC) blocks unsigned apps from reading files in Documents,
+Downloads, and Desktop when you launch them from their icon. Terminal usually already has
+that permission, which is why the same app can open from Terminal (or from Clip
+Maker.command in a Terminal window) and then fail silently from the Dock or the
+Applications folder.
+
+The project folder must stay somewhere the unsigned .app is allowed to read. The plain
+home folder is that place, for example:
+
+    /Users/yourname/clip-maker
+
+Not:
+
+    /Users/yourname/Documents/...
+    /Users/yourname/Downloads/...
+    /Users/yourname/Desktop/...
+
+After you move the folder, run make_app.sh again from inside it. You can instead grant the
+.app Full Disk Access in System Preferences (or System Settings) > Security and Privacy >
+Privacy, but moving the folder is simpler.
+
+The README still mentions Documents as an example unzip location. That is fine if you only
+use Clip Maker.command. It is a problem once you build the .app wrapper.
+
+The .app wrapper points at the folder's path
+--------------------------------------------
+
+Clip Maker.app does not contain the Python code, the virtualenv, or ffmpeg.
+Contents/MacOS/ClipMaker is a short bash script with APP_DIR hardcoded to whatever folder
+make_app.sh was in when you ran it. If you move, rename, or delete that folder, the icon
+will show an alert and refuse to start until you rerun make_app.sh from the new location.
+
+Do not run make_app.sh until first-run setup has finished at least once, so the stamp file
+exists. Otherwise the icon just opens Terminal and runs the launcher again.
+
+ClipMaker.log
+-------------
+
+When you start the app from the .app icon, standard output and standard error go to:
+
+    ~/Library/Logs/ClipMaker.log
+
+If Python exits with a non-zero status, an alert appears and TextEdit opens that log. This
+was added because a failed icon launch used to show nothing at all.
+
+Starting from Clip Maker.command does not write this log; you see output in the Terminal
+window instead.
+
+To start the wrapper from Terminal (useful when debugging a silent Dock launch), keep
+quotes around the space in the name:
+
+    "$HOME/Applications/Clip Maker.app/Contents/MacOS/ClipMaker"
+
+The Dock may show "Python"
+--------------------------
+
+The running process is .venv/bin/python app.py, not a signed native binary named Clip
+Maker. The Dock and the menu bar can therefore show "Python" while the window title is
+"Clip Maker". That is expected for this kind of wrapper. Closing the window quits that
+Python process.
+
+Other Mac details worth knowing
+-------------------------------
+
+The launcher and the wrapper add /opt/homebrew/bin (Apple Silicon), /usr/local/bin (Intel
+Homebrew), and ~/.deno/bin to PATH. core.py adds the same, plus /opt/local/bin (MacPorts).
+
+Use cookies from may make macOS ask for permission to read that browser's data. Safari in
+particular may need Full Disk Access for Terminal or Python. The README notes that Opera
+GX counts as Opera.
+
+LSMinimumSystemVersion in the Info.plist is 11.0, but the project has been used on macOS
+12. That key only affects what the .app bundle advertises.
+
+Command-Return is the keyboard shortcut for Make clip. The Paste button and Return in the
+URL box start a fetch.
+
+8. HOW TO MODIFY OR EXTEND
+==========================
+
+Because the GUI and the logic are split, most changes belong in one place only. After you
+edit Python, just reopen the app; you do not need to rerun make_app.sh unless you changed
+the launcher, the wrapper script, or the icon. If you change requirements.txt, the next
+launch will notice the checksum and reinstall packages. To force a clean environment:
+
+    "./Clip Maker.command" --reinstall
+
+Add or change an output format
+------------------------------
+
+    1. core.AUDIO_QUALITIES or core.VIDEO_QUALITIES (the lists the Quality menu is built
+    from).
+    2. format_selector() in core.py (how yt-dlp chooses streams).
+    3. build_download_opts() (postprocessors, merge format).
+    4. _cut_locally() (the ffmpeg command used on the fallback path).
+    5. ClipJob.run() and unique_basename (the file extension).
+    6. _ensure_quicktime_compatible() if the new video format should still be remuxed or
+    re-encoded for QuickTime.
+    7. app.py _on_kind() and _save_prefs() if the Quality labels or the config keys
+    change.
+    8. tests/test_core.py, so the new path is checked.
+
+Change the default format, quality, or folder
+---------------------------------------------
+
+The defaults live in core.load_config():
+
+    kind             "MP4"
+    audio_quality    "192"
+    video_quality    "1080p"
+    cookies_browser  "None"
+    output_dir       ~/Downloads  (or home if Downloads is missing)
+
+Existing users already have a config.json; those values win over the defaults until the
+file is deleted.
+
+The default End time after a fetch is min(duration, 30) seconds, set in app.py _show_info.
+The default Start is 0.
+
+Change colours, window size, or labels
+--------------------------------------
+
+All in app.py: ACCENT, ACCENT_HOVER, geometry("720x760"), minsize(640, 700), and the
+strings in the _build_* methods. Appearance is "system" (follows the Mac) and the colour
+theme is "blue".
+
+Change which browsers appear under "Use cookies from"
+-----------------------------------------------------
+
+COOKIE_BROWSERS in app.py. The value (other than None) is passed to yt-dlp as
+cookiesfrombrowser, lowercased. Only names yt-dlp actually supports will work.
+
+Change first-run setup (Homebrew, Deno, Python versions)
+--------------------------------------------------------
+
+Clip Maker.command. The Python search list and the Deno install command are there. The
+stamp filename .venv/.clipmaker-ready-v1 is also how the .app wrapper decides that setup
+is done; if you rename the stamp, change make_app.sh to match.
+
+Change the .app name, icon, or identifier
+-----------------------------------------
+
+make_app.sh (Info.plist, the executable name ClipMaker, the destination
+~/Applications/Clip Maker.app) and assets/icon.icns. Rerun make_app.sh after those
+changes.
+
+Pass a URL in when starting
+---------------------------
+
+Already supported:
+
+    .venv/bin/python app.py 'https://...'
+
+fills the box and fetches after 400 ms. You could hook this to an open this link with Clip
+Maker service if you want one.
+
+Run the tests after a change
+----------------------------
+
+    .venv/bin/python -m tests.test_core
+    .venv/bin/python -m tests.test_core --online
+    .venv/bin/python -m tests.test_core --online --fallback
+
+Offline tests do not need YouTube; they do need ffmpeg.
+
+Things this code does not do (so you do not look for them)
+----------------------------------------------------------
+
+It does not update ffmpeg, Deno, or the app's own Python files when you click Update
+downloader.
+It does not sign or notarize the .app.
+It does not download whole playlists (noplaylist is on; a playlist URL is either reduced
+to the first video at info-time or rejected if there are no entries).
+It does not clip live streams or upcoming premieres.
+It does not keep a history of made clips, other than the last path used by Show in Finder.
+
+
+9. GLOSSARY
+===========
+
+    yt-dlp
+        A command-line (and Python) tool that talks to YouTube and many other sites, finds
+        the real media URLs, and downloads them. Clip Maker uses it as a Python library.
+        YouTube changes often, which is why the app has an Update downloader button.
+
+    ffmpeg
+        A command-line tool that cuts, converts, and re-encodes audio and video. ffprobe
+        is its companion for inspecting a file (duration and codec names). Both usually
+        come from the same Homebrew ffmpeg formula.
+
+    venv (virtual environment)
+        A private Python folder, here clip-maker/.venv, with its own interpreter and
+        packages. The app's customtkinter, Pillow, yt-dlp, and certifi live only there, so
+        they do not mix with any other Python on the Mac.
+
+    Tk / CustomTkinter
+        Tk is the window toolkit that ships with Python (the tkinter module).
+        CustomTkinter is a pip package on top of Tk that draws rounded buttons, cards, and
+        a dark mode. Homebrew's python formula often ships without Tk; the matching
+        python-tk@3.x formula adds it.
+
+    codec
+        The method used to compress audio or video (for example H.264, AAC, MP3, VP9,
+        Opus). A container (MP4, MKV, WebM) is the file format that holds one or more
+        coded streams.
+
+    H.264 / AAC
+        The video and audio codecs that Apple's QuickTime, Photos, iMovie, and iPhone play
+        without extra software. YouTube also offers newer codecs (VP9, AV1, Opus) that
+        those apps often will not play. Clip Maker prefers H.264 + AAC and re-encodes when
+        it has to.
+
+    keyframe
+        A complete video frame that can be decoded on its own. Most frames in between only
+        store changes. If you cut on a non-keyframe without re-encoding, the start of the
+        clip can be wrong or blank. force_keyframes_at_cuts tells yt-dlp and ffmpeg to
+        re-encode around the cut points so the start and end times are accurate.
+
+    JS runtime (JavaScript runtime)
+        A program that can run JavaScript (Deno, Node, or Bun). YouTube serves some of the
+        logic needed to find download URLs as JavaScript. Modern yt-dlp needs one of these
+        runtimes to see all available formats. Clip Maker installs Deno if neither Deno
+        nor Node is already on PATH.
+
